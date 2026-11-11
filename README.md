@@ -72,7 +72,7 @@ emits one unit per control block regardless of the range fields; read pages one
 at a time with `readp` instead.
 
 A full single-read image of the data region already sits in
-`out/region_984_1064/` (43 programmed pages from pages 984–1064, one
+`out/region_984_1064/` (48 programmed pages from pages 980–1064, one
 `page_<n>.bin` each, all distinct). Re-read any of them with `--votes 15` for a
 cleaner copy of a marginal page.
 
