@@ -331,6 +331,28 @@ Bank select is not a clean 1-of-4. Byte 11 = `0x01`, `0x02`, `0x03`, `0x05`,
 `00 00 00 00`. The socket presents the die on any selector with bit 0 or bit 1
 set.
 
+### What can still be changed, and from where
+
+Measured 2026-11-11. Only one of these is reachable over USB.
+
+| Target | USB | ISP (SOIC-8 clip) |
+|---|---|---|
+| FPGA design | **untested** — EP 0x02 is a config loader; only the vendor stream has ever been accepted | no |
+| ATtiny13A flash/EEPROM/fuses | **no** — `A0 A1 B0 C0 D0` all silent, even right after a good ID read | full, reversible against the sealed `a29117f3…` image |
+| SX2 firmware | **no** — no vendor request handler on 0x00–0x3F, no DFU path | no |
+| NAND cells | read-only (READ ID, READ); every other op dropped | no |
+
+The single open USB experiment is a hand-built FPGA config stream: 6×`FF`
+preamble, config bytes, 4×`00` postamble, DCLK via the `0x20 00`/`0x20 01` pulse
+pair already used in the READ program. If the EP1C3 accepts it, every "the FPGA
+does not forward it" wall above stops being a wall, and the recovery is a
+power cycle plus `restore_linux.py`. A failed attempt is likewise cleared by a
+power cycle; nothing in it touches the NAND.
+
+ISP is not a substitute: it reaches the ATtiny and nothing else. Its value is
+ground truth — the ATtiny supplies every descriptor byte, so changing one byte
+at a time shows exactly what the SX2 asks for at boot, which USB probing cannot.
+
 ### Compared with NAND_Reader.exe (static only)
 
 Read out of the vendor binary by disassembly; **not** confirmed against a
