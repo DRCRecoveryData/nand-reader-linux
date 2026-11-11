@@ -138,7 +138,7 @@ class ReaderWindow(QMainWindow):
         self.logv.appendPlainText(msg)
 
     def _pick_payload_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "Payload directory", self.payload_dir.text())
+        d = QFileDialog.getExistingDirectory(self, "Payload directory", self.payload_dir.text().strip())
         if d:
             self.payload_dir.setText(d)
 
@@ -148,7 +148,7 @@ class ReaderWindow(QMainWindow):
             self.out.setText(p)
 
     def _check_payloads(self):
-        rows, missing = payloads_check.check(self.payload_dir.text())
+        rows, missing = payloads_check.check(self.payload_dir.text().strip())
         for name, note, size, sha, swap in rows:
             self._log(f"{name:<18}{note}")
         self._log("all payloads present" if not missing else "missing: " + ", ".join(missing))
@@ -184,67 +184,74 @@ class ReaderWindow(QMainWindow):
     def _read_id(self):
         cv = int(round(self.cv.value() * 100))
         banks = self.banks.value()
-        pdir = self.payload_dir.text()
+        pdir = self.payload_dir.text().strip()
 
         def job(w):
-            with nl.Reader() as r:
-                r.load_payloads(pdir)
-                time.sleep(nl.SETTLE_S)
-                w.log.emit(f"rail up: {r.power(cv)} cV")
-                try:
-                    for bank in range(1, banks + 1):
-                        w.id_row.emit(bank, r.read_id(bank).hex(" "))
-                finally:
-                    r.power_down()
-                    w.log.emit("rail down")
+            for bank in range(1, banks + 1):
+                ident = None
+                for attempt in range(1, 31):
+                    try:
+                        nl.power_cycle(settle=nl.LONG_OFF_S)
+                    except nl.ReaderError:
+                        nl.bus_reset()
+                    try:
+                        with nl.Reader() as r:
+                            r.load_payloads(pdir)
+                            ident = r.read_id(bank)
+                    except (nl.usb.core.USBError, nl.ReaderError) as exc:
+                        w.log.emit(f"bank {bank} [{attempt}] no reply ({exc})")
+                        continue
+                    if ident[:4].hex() == "89c40832" or ident.count(0) != len(ident):
+                        break
+                    w.log.emit(f"bank {bank} [{attempt}] {ident[:4].hex(' ')}")
+                if ident is None:
+                    w.id_row.emit(bank, "no reply")
+                else:
+                    w.id_row.emit(bank, ident.hex(" "))
 
         self.ids.clear()
         self._start(job)
 
     def _dump(self):
         cv = int(round(self.cv.value() * 100))
-        pdir = self.payload_dir.text()
+        pdir = self.payload_dir.text().strip()
         out = self.out.text()
         start, end, unit, bank = (self.start.value(), self.end.value(),
                                   self.unit.value(), self.dbank.value())
-        total = (end - start) * unit
 
         def job(w):
-            with nl.Reader() as r:
-                r.load_payloads(pdir)
-                time.sleep(nl.SETTLE_S)
-                w.log.emit(f"rail up: {r.power(cv)} cV")
-                t0 = time.time()
-                written = 0
-                try:
-                    r._chunked(r.chip_image)
-                    r._out(r.program_block)
-                    ctl = bytearray(32)
-                    ctl[0:4] = start.to_bytes(4, "little")
-                    ctl[4:8] = end.to_bytes(4, "little")
-                    ctl[8:10] = unit.to_bytes(2, "little")
-                    ctl[11] = 1 << (bank - 1)
-                    ctl[14] = 0x35
-                    ctl[15] = 0x22
-                    ctl[16:] = b"\xff" * 16
-                    r._out(bytes(ctl))
-                    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-                    with open(out, "wb") as fh:
-                        while written < total:
-                            want = min(1 << 20, total - written)
-                            buf = r._in(want)
-                            if not buf:
-                                raise nl.ReaderError(f"short delivery at {written} B")
-                            if len(buf) > want:
-                                buf = buf[:want]
-                            fh.write(buf)
-                            written += len(buf)
-                            w.progress.emit(int(100 * written / total))
-                            w.log.emit(f"{written}/{total} B  "
-                                       f"{written / 1e6 / max(time.time() - t0, 1e-9):.1f} MB/s")
-                finally:
-                    r.power_down()
-                    w.log.emit("rail down")
+            w.log.emit("rail up")
+            os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+            written = 0
+            pages = list(range(start, end))
+            t0 = time.time()
+            try:
+                with open(out, "wb") as fh:
+                    for n, page in enumerate(pages):
+                        try:
+                            nl.power_cycle(settle=nl.LONG_OFF_S)
+                        except nl.ReaderError:
+                            nl.bus_reset()
+                        with nl.Reader() as r:
+                            r.load_payloads(pdir)
+                            r.boot_rail(cv)
+                            d = r.read_page(page, unit=unit, bank=bank)
+                        if d is None:
+                            w.log.emit(f"p{page}: SHORT")
+                            continue
+                        fh.write(d)
+                        written += len(d)
+                        if d.count(0xFF) == len(d):
+                            cls = "FF"
+                        elif d.count(0x00) == len(d):
+                            cls = "00"
+                        else:
+                            cls = "data"
+                        w.progress.emit(int(100 * (n + 1) / len(pages)))
+                        w.log.emit(f"p{page}: {cls} {len(d)} B  "
+                                   f"{(written / 1e6 / max(time.time() - t0, 1e-9)):.2f} MB/s")
+            finally:
+                w.log.emit("rail down")
             w.log.emit(f"wrote {written} B to {out}")
 
         self.bar.setValue(0)
