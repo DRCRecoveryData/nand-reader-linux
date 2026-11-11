@@ -1,0 +1,10 @@
+LIBRARY kernel32_real.dll
+EXPORTS
+    GetProcAddress@8 @232
+    VirtualAlloc@16 @1487
+    LoadLibraryA@4 @1142
+    CreateFileA@28 @716
+    WriteFile@20 @1527
+    ReadFile@20 @1249
+    CloseHandle@4 @687
+    SetFilePointer@16 @1412

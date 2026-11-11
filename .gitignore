@@ -13,3 +13,9 @@ __pycache__/
 # transient dumps
 dumps/
 out/block_1024/
+
+# research build junk / backups / logs
+research/k32hook/*.bak*
+research/k32hook/*.out
+research/k32hook/afterboot.log
+research/k32hook/__pycache__/
