@@ -1,0 +1,9 @@
+#!/bin/sh
+# NAND reader front end:  nand gui | nand id | nand probe | nand check | nand dump ...
+cd "$(dirname "$0")"
+cmd="${1:-gui}"; shift 2>/dev/null
+case "$cmd" in
+  check) exec python3 payloads_check.py "$@" ;;
+  gui)   exec python3 nand_gui.py "$@" ;;
+  *)     exec python3 nand_linux.py "$cmd" "$@" ;;
+esac

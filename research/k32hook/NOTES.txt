@@ -1,0 +1,66 @@
+k32hook -- what was learned (2026-11-11, post-reboot continuation)
+
+Goal: run vendor NAND_Reader.exe (v5.70) under Wine with its
+\\.\NAND_Flash_Reader2 I/O relayed to nanddev_proxy.py, to record the vendor's
+USB frame for ID/read/dump operations.
+
+RESULT: the harness now works end-to-end and the vendor's real device traffic
+is captured (capture_v570_id.log, capture_v570_shim.log).  It confirms what the
+native driver already saw: on this hardware the reader returns a fixed pattern
+for the ID leg, and the vendor itself fails to recognise a chip, so it never
+proceeds to a dump.
+
+How the harness was made to work this session:
+  * Injection, not IAT patching.  licr.py's tracer path is fragile on this host
+    (find_module breaks on Wine's anonymous mappings).  Instead launch the exe
+    normally, read its *Wine* pid from `wine tasklist.exe` (NOT the host pgrep
+    pid), and Inject with CreateRemoteThread(LoadLibraryA):
+        wine ./inject.exe <wine_pid> 'Z:\tmp\cap4\drive_c\nr\k32hook.dll'
+    k32hook's DllMain patches its own six KERNEL32 IAT slots and logs
+    "STAGE loaded, 6 imports patched".
+  * Transport is a NAMED PIPE, not AF_UNIX.  Wine 9.0's ws2_32 rejects
+    AF_UNIX: WSAStartup succeeds but socket(AF_UNIX,...) returns
+    WSAEAFNOSUPPORT (10047) in every process, including a fresh rundll32.
+    So the chain is:
+        k32hook.dll --\\.\pipe\nanddev--> pipesrv.exe --TCP 47199-->
+        pipe_bridge.py --AF_UNIX--> nanddev_proxy.py --> libusb/YKUSH
+    pipesrv.exe (Wine) serves \\.\pipe\nanddev and relays each accepted pipe to
+    127.0.0.1:47199; pipe_bridge.py (Linux) accepts TCP and relays to
+    /tmp/nanddev.sock.  Start the whole chain with startchain.sh.
+  * One persistent pipe per vendor process: g_pipe is never closed on the
+    'C' op (only the proxy's device is kept open).  Reopening the named pipe
+    from the same process race the server (ERROR_PIPE_BUSY 231).  The proxy
+    accepts 'O' again after 'C' on the same connection, so this is fine.
+  * The shim's "settled after N ms" is the loader-phase barrier: the wrapper
+    that first runs sends 'B', the external patcher releases BusyFlag after the
+    IAT is final.  Without it, the vendor's early CreateFile calls run before
+    the IAT is rewritten.
+
+Press the GUI's ID action to trigger the sequence: it is one of the pink
+buttons on the strip (*, ID, Read, Conf, Extra) in the window at +4+57.
+The window is a custom COSMIC/X11 client: xdotool mousemove/click at screen
+coords = (4+x, 57+y) with x,y client-relative works; PostMessage (Poke) does
+NOT reach it.
+
+Captured vendor ID sequence (per bank probe; bank byte cycles 01,02,04,08):
+    W 1254752   FPGA bitstream (== PWR_IMAGE_LEN; power_init.bin/nand_init.bin)
+    W 2048      2 KB program block (== nand_linux.id_table())
+    W 32        descriptor 00 00 00 00 01 00 00 00 04 00 04 <bank> 65 00 35 77
+                            + 16 x ff   (native DESCRIPTOR has 1a at idx 12;
+                                         vendor uses 65 as the ID opcode)
+    R 4         read 4-byte ID
+    close, reopen, next bank
+Observed IDs:  bank 01 -> 89 c4 08 32 ; banks 02/04/08 mostly 00 00 00 00.
+The GUI leaves "Chip" empty because 89c40832 does not match its chip DB, so
+Read/Conf do nothing and no dump is ever issued.  This is the SAME fixed-pattern
+behaviour the native driver hits -- now confirmed with the real vendor binary,
+so the limitation is the FPGA/CPLD path (or an absent NAND), not the driver
+protocol.
+
+Files:
+  hook.c k32hook.dll   shim (named-pipe transport, KERNEL32 wrappers, Poke/Dump)
+  inject.exe/inject.c  LoadLibraryA injector (use Wine pid)
+  pipesrv.c pipesrv.exe  named-pipe <-> TCP relay (Wine side)
+  pipe_bridge.py       TCP <-> AF_UNIX relay (Linux side)
+  startchain.sh        start proxy + bridge + pipesrv
+  capture_v570_id.log, capture_v570_shim.log  the captured sequence

@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NAND_Reader on Linux — Soft-Center NAND Flash Reader 2.0</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #c9d1d9;
+    --muted: #8b949e; --accent: #58a6ff; --green: #3fb950; --red: #f85149;
+    --amber: #d29922; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.6; }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 0 20px 80px; }
+  header { padding: 56px 0 32px; border-bottom: 1px solid var(--border); }
+  h1 { font-size: 2rem; margin: 0 0 8px; letter-spacing: -.02em; }
+  h1 .id { color: var(--accent); font-family: var(--mono); font-size: 1.1rem;
+    font-weight: 500; }
+  .sub { color: var(--muted); font-size: 1.05rem; margin: 0; max-width: 720px; }
+  h2 { font-size: 1.3rem; margin: 48px 0 16px; padding-bottom: 8px;
+    border-bottom: 1px solid var(--border); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; color: var(--accent); }
+  p { color: var(--text); }
+  code, pre { font-family: var(--mono); font-size: .88rem; }
+  code { background: var(--panel); padding: 2px 6px; border-radius: 4px;
+    border: 1px solid var(--border); }
+  pre { background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px; overflow-x: auto; }
+  pre code { background: none; border: none; padding: 0; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0;
+    font-size: .93rem; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; font-size: .85rem;
+    text-transform: uppercase; letter-spacing: .04em; }
+  tr:last-child td { border-bottom: none; }
+  .ok { color: var(--green); font-weight: 600; }
+  .no { color: var(--red); font-weight: 600; }
+  .warn { color: var(--amber); font-weight: 600; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr));
+    gap: 14px; margin: 20px 0; }
+  .card { background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px; }
+  .card .k { color: var(--muted); font-size: .8rem; text-transform: uppercase;
+    letter-spacing: .04em; }
+  .card .v { font-size: 1.5rem; font-weight: 700; margin-top: 4px; }
+  .card .v.ok { color: var(--green); }
+  .pill { display: inline-block; font-size: .75rem; padding: 2px 8px;
+    border-radius: 999px; border: 1px solid var(--border); color: var(--muted);
+    font-family: var(--mono); }
+  .callout { border-left: 3px solid var(--accent); background: var(--panel);
+    padding: 12px 16px; border-radius: 0 8px 8px 0; margin: 16px 0; }
+  .callout.warn { border-color: var(--amber); }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  footer { margin-top: 56px; padding-top: 20px; border-top: 1px solid var(--border);
+    color: var(--muted); font-size: .85rem; }
+  ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>NAND_Reader on Linux <span class="id">03eb:5903</span></h1>
+  <p class="sub">Native Linux driver for the Soft-Center NAND Flash Reader 2.0.
+    No vendor Windows software and no Wine at runtime &mdash; the reader is driven
+    directly over libusb.</p>
+</header>
+
+<div class="cards">
+  <div class="card"><div class="k">Chip ID</div><div class="v ok">89 c4 08 32</div></div>
+  <div class="card"><div class="k">Page read</div><div class="v ok">working</div></div>
+  <div class="card"><div class="k">Banks live</div><div class="v ok">1 &amp; 2</div></div>
+  <div class="card"><div class="k">Spare / OOB</div><div class="v ok">--unit 2176</div></div>
+</div>
+
+<h2>What this is</h2>
+<p>The reader is a Cypress FX2 / EZ-USB style part (VID:PID <code>03eb:5903</code>)
+  with an FPGA in front of the NAND. The host streams a bitstream and a small
+  micro-op program, then reads the die. This project reproduces that protocol on
+  Linux and drives real 2&nbsp;KB NAND pages.</p>
+
+<h2>Windows vs Linux</h2>
+<p>Under Windows, the vendor app <code>NAND_Reader.exe</code> (via
+  <code>FlashReader2.sys</code>) performs the ID leg and then <em>stops</em>:
+  because <code>89c40832</code> is not in its chip database, its Read/Conf
+  controls stay disabled and it never issues a page read.</p>
+<p>The Linux driver speaks the <strong>same wire protocol</strong> (verified
+  byte-for-byte against the captured vendor traffic) but does not stop at the
+  un&#8209;recognised ID &mdash; it drives the vendor READ micro-op directly.</p>
+
+<table>
+  <thead><tr><th>Capability</th><th>Windows (vendor)</th><th>Linux (this)</th></tr></thead>
+  <tbody>
+    <tr><td>Bitstream / program / descriptor / ID</td><td class="ok">yes</td><td class="ok">identical</td></tr>
+    <tr><td>Stops at unrecognised ID</td><td class="no">yes</td><td class="ok">no</td></tr>
+    <tr><td>Page read</td><td class="no">never reached</td><td class="ok">works</td></tr>
+    <tr><td>Spare / OOB read</td><td class="no">never reached</td><td class="ok">works</td></tr>
+    <tr><td>Banks readable</td><td>1</td><td class="ok">1 &amp; 2</td></tr>
+    <tr><td>FPGA ceiling (1 unit / boot, banks 3&ndash;4 dead)</td><td>yes</td><td>yes (same hw)</td></tr>
+  </tbody>
+</table>
+
+<h2>Status</h2>
+<table>
+  <thead><tr><th>Part</th><th>State</th></tr></thead>
+  <tbody>
+    <tr><td>USB enumerate + claim (EP2 OUT / EP6 IN)</td><td class="ok">working</td></tr>
+    <tr><td>ID leg</td><td class="ok">89 C4 08 32</td></tr>
+    <tr><td>Page read (<code>readp</code>)</td><td class="ok">real per-page data</td></tr>
+    <tr><td>Spare area (<code>--unit 2176</code>)</td><td class="ok">2048 B + 128 B</td></tr>
+    <tr><td>Banks on read</td><td class="warn">1 &amp; 2 real; 3 &amp; 4 unselected</td></tr>
+    <tr><td>Range dump (<code>dump</code>)</td><td class="no">one fixed unit; use readp</td></tr>
+    <tr><td>Power leg (rail + DAC echo)</td><td class="ok">working</td></tr>
+  </tbody>
+</table>
+
+<h2>Quick start</h2>
+<pre><code>./nand check                       # payload status
+./nand probe                       # safe bring-up probe
+./nand info                        # describe the USB device
+./nand power --cycle --cv 330      # raise rail, read DAC echo, lower
+./nand id --cycle                  # expect 89 c4 08 32
+./nand readp 1010 1026 2040 --out out/      # read single pages
+./nand readp 1013 --votes 15 --out out/     # majority-vote a marginal page
+./nand readp 1026 --bank 2                  # second bank</code></pre>
+
+<h2>How the read works</h2>
+<p>Each page is read with the vendor's READ program
+  (<code>NAND_Reader.exe FUN_0045e3d0</code>): reset, three row-address cycles,
+  two column cycles, then <code>11 30</code> (READ). The page number is carried
+  in the 32-byte control block, not in the row cycles or the trailer. The FPGA
+  emits exactly one unit per power-up, so every page needs its own YKUSH cold
+  cycle (~35&nbsp;s/page).</p>
+
+<h3>What the chip contains</h3>
+<ul>
+  <li>2&nbsp;KB pages in <strong>8-page blocks</strong>: one erased page,
+    then seven data-or-blank pages. Erased pages land on multiples of 8.</li>
+  <li>Programmed data is high-entropy (~7.4 bits/byte) &mdash; scrambled or
+    encrypted; main and spare alike. This is a raw-cell read, not a decoded image.</li>
+  <li>Banks 1 and 2 return different, valid data; banks 3&ndash;4 return
+    <code>30 30 30 &hellip;</code> because the FPGA leaves them unselected.</li>
+</ul>
+
+<div class="callout">
+  <strong>Cleaning bit errors.</strong> A few cells per page are marginal and
+  flip single bits between reads. <code>--votes N</code> reads the page N times
+  and keeps the per-bit majority. At 15 votes the page head is stable; ~12 bits
+  per page stay undecided even at 31 votes &mdash; the raw-read floor without ECC.
+</div>
+
+<h2>Limits (hardware, not code)</h2>
+<ul>
+  <li>One page per power cycle &mdash; no fast streaming.</li>
+  <li>Banks 3 and 4 are never selected by the FPGA.</li>
+  <li>No usable ECC block in the spare area; content is encrypted/scrambled.</li>
+  <li>No write / erase implemented.</li>
+</ul>
+
+<div class="callout warn">
+  <strong>Recovered images.</strong> A single-read image of the data region sits in
+  <code>out/region_984_1064/</code> &mdash; 43 programmed pages (984&ndash;1064),
+  one <code>page_&lt;n&gt;.bin</code> each. Re-read any with
+  <code>--votes 15</code> for a cleaner copy.
+</div>
+
+<h2>How it was made to work</h2>
+<ul>
+  <li><strong>Protocol</strong> from the reference doc + static analysis; libusb
+    on EP2 OUT / EP6 IN, YKUSH power-cycle for recovery.</li>
+  <li><strong>Chip presence</strong>: rail ADC tracks setpoint; ID answers
+    <code>89 c4 08 32</code>.</li>
+  <li><strong>Capture</strong>: ran the real vendor binary under Wine with its
+    device I/O hooked &mdash; proved the Linux frames match byte for byte.</li>
+  <li><strong>Disassembly</strong> of the READ path: found the <code>0x30</code>
+    READ program and control-block layout.</li>
+  <li><strong>Empirical sweep</strong>: the encoding that reproduces bit-exactly
+    across cold cycles puts the page in the control block.</li>
+  <li><strong>Verified real flash</strong> via the 8-page block cadence.</li>
+</ul>
+
+<footer>
+  Native libusb driver &middot; no vendor software at runtime &middot;
+  <span class="pill">Soft-Center NAND Flash Reader 2.0</span>
+  <span class="pill">03eb:5903</span>
+  <span class="pill">libusb</span>
+</footer>
+
+</div>
+</body>
+</html>

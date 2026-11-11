@@ -1,0 +1,85 @@
+NAND_Reader.exe READ path -- disassembly findings (2026-11-11)
+
+Binary: /tmp/cap4/drive_c/nr/NAND_Reader.exe (v5.70, PE32 i386, image base 0x400000)
+
+## The single wire routine (ID and READ share it)
+FUN_00424f20(this, config, program):
+  1. FUN_00404030 / FUN_00424a20   (device setup, power object)
+  2. FUN_00424ea0 -> FUN_00424dd0  (TSOP_48 power I/O object when config+0x28==1)
+  3. FUN_00424440(asm, chip_image @ 0x530dcc)   stream 1,254,752 B bitstream
+  4. pair-swap 0x400 pairs over the 0x800-byte program   (== nand_linux.id_table swap)
+  5. vtable+4(program, 0x800)    write the 2048-byte program block
+  6. vtable+4(config+0xc6, 0x20) write the 32-byte descriptor from the CONFIG,
+                                 NOT from a range-control built on the fly
+  7. read data
+
+=> The 32-byte descriptor is a field INSIDE NAND_Config (bytes 0xc6..0xe5), filled
+   at runtime from the selected chip's record. It is not the _range_ctl() layout.
+
+## Program builder
+FUN_00460500(this, config):           builds the 0x800 program and calls 00424f20
+  if config[0xc1] == 0 : FUN_0045ed10(config)   <- FULL per-chip program
+  else                 : FUN_0041edc0(config)   <- simplified ID program
+
+FUN_0041edc0 (simplified) is exactly ID_TABLE_OPS:
+  21 00,80 00, 11 FF,80 00, 21 00,80 00, 11 90,80 00,
+  10 00,80 00, 20 00,80 00, 20 01,80 00, 22 00,80 00
+  (11 90 = READ ID)
+
+FUN_0045ed10 (full) dispatches on the chip command string at config+0xa4:
+  ""        -> FUN_0045e3d0   (generic read, see below)
+  "05_E0"   -> FUN_0045e4f0
+  "WL v2"   -> FUN_0045e740
+  others    -> FUN_0045e710/0045e8b0/0045e9d0 ; "HYBRIDx3" -> FUN_0045ece0
+  tail (all): 30 01, 30 02, 30 03, 30 04, 30 05 (DMA descriptor prefix),
+              F0 00, 30 hi, 30 lo (page address), 20 01,80 00, 22 00,80 00
+
+FUN_0045e3d0 (generic READ), core:
+  11 00, 80 00,                          (reset)
+  N x (10 00, 80 00)                     N = config[0]   row-address cycles
+  M x (13 i , 80 00)                     M = config[1]   column-address cycles
+  11 30, 80 00,                          *** READ (0x30) ***  vs 11 90 = READ ID
+  21 00, 80 00, 20 00, 80 00, 21 00, 80 00
+
+FUN_0045eaf0 / FUN_0045ece0 (read-retry variants) add:
+  11 EF (set feature), 10 D2 / 10 D6 (fixed high addr bytes),
+  11 43 (read column enhanced), 11 46 (read cache random), 11 05 (status),
+  11 E0 (cache read), 11 3F (enhanced status)
+
+## The micro-op / template interpreter
+FUN_00418de0(asm, op, arg) appends (op,arg), bumps asm+0x804 length.
+FUN_0041e9b0(asm, tmpl) compiles a TEXT template token stream to ops:
+  token "Cmd"  -> 11 <byte>   NAND command
+  token "Addr" -> 10 <byte>   row-address cycle  (this carries the PAGE address)
+  token "Data" -> 12 <byte>   literal data byte
+  token "Wait" -> wait op ; token "Read" -> FUN_0047b330
+FUN_0047b380(asm,a,b,c,d) emits 4 x (12 <byte>) = 4 literal address bytes.
+The templates are the compiled-in classes:
+  NAND_Reader_Internal::NAND_Assembler::Read_Retry::{Micron,Micron_v2..v4,
+  Samsung_v1/v3/v4, Sandisk_v1..v5}  (RTTI names at .rdata 0x4e1b80+).
+Their template strings are built at runtime and selected by the chip record.
+
+## Opcode table (observed in code)
+  0x11 cmd   NAND command: 0x30 READ, 0x90 READ ID, 0x05 status, 0xE0 cache-read,
+             0x3F enhanced status, 0xEF set-feature, 0x43 read-column, 0x46 rnd
+  0x10 b     row-address cycle (page address)
+  0x13 b     column-address cycle
+  0x12 b     literal address/data byte
+  0x80 00    wait
+  0x21/0x20/0x22/0xF0/0x30   FPGA / DMA control (0x22 = trigger, 0x20 01 = inc)
+
+## What the native driver does differently
+nand_linux.py builds the descriptor with _range_ctl() (start/end/unit/flags/bank/
+0x35/re). The vendor writes config[0xc6] instead (a chip-record descriptor that
+also encodes bus width x8/x16 via flags set in FUN_00460a00: local_7c for "x8",
+local_77 for "16-8"). That mismatch is the leading suspect for the fixed pattern.
+
+## Confirmed empirically this session
+ - a chip answers READ ID 89 c4 08 32 on banks 1 and 2 (00 00 00 00 on 3,4)
+ - rail ADC tracks the setpoint (327 cV @ 330) => a die load is present
+ - asking for a page with the correct 11 30 READ program returns a FULL 2048-byte
+   page (vs 4 bytes for the ID leg), but all 0xFF until the config descriptor and
+   page-address encoding are matched to the vendor record.
+
+See probe_read2.py (vendor-faithful read program) and probe_addr.py (page-address
+encoding sweep) in the repo root.

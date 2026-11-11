@@ -1,0 +1,15 @@
+# Large / regenerable / vendor artifacts — never commit these
+wine_backup/
+research/shim-interpose/
+__pycache__/
+*.pyc
+
+# compiled binaries and Windows DLL/EXE builds
+*.dll
+*.exe
+*.o
+*.a
+
+# transient dumps
+dumps/
+out/block_1024/
