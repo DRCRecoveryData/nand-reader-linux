@@ -20,6 +20,9 @@ No vendor Windows software is used: `./nand` drives the reader with libusb.
 | Range dump (`dump`) | range-control path still returns one fixed unit; read page-by-page instead |
 | Power leg (rail + DAC echo) | working, no YKUSH needed |
 | `30 XX` status frame | answers on the power design, `[30, op, v_hi, v_lo]` |
+| FPGA restore (`restore_linux.py`) | working — power design PASS at 327 cV, reader design configures |
+| Reader backup (`reader_backup.py`) | working — sealed archive, `sha256sum -c` all OK |
+| Full USB surface | mapped — see [USB surface](#usb-surface)
 
 ### Reading real pages (`readp`)
 
@@ -240,6 +243,94 @@ times out. A timed-out read wedges both endpoints until a physical replug;
 neither a USB bus reset nor `clear_halt` clears it. So: one operation per
 replug — `id` and `power` cannot share a session.
 
+## Backup and restore
+
+Two separate things, and only the second needs the vendor images.
+
+### Restore the FPGA (`restore_linux.py`)
+
+The EP1C3 is configured from SRAM, so it comes up blank after every power
+cycle and can be re-streamed. Only a power cycle asserts nCONFIG, so the script
+refuses to stream unless the board was just replugged or it dropped power itself
+through the YKUSH XS. Every image is sha256-gated first; nothing here touches
+the NAND.
+
+```
+python3 restore_linux.py --images DIR --power-cycle --check
+python3 restore_linux.py --images DIR --power-cycle --image map --read 4
+```
+
+Power design → `4d 80 0f e0` = `RESULT PASS 327 centivolts`. Reader design →
+`RESULT OK reader design configured`; the 4-byte read answers `00 00 00 00` in
+this order because the chip design is alone in the slot, which is the expected
+"configured, no chip selected" reply. A real ID needs the power-design-first
+order in `nand_linux.Reader.id_at`. `vendor_program.bin` is also byte-compared
+against the 2,048 B block `nand_linux` builds in code, so the two drivers can
+never drift.
+
+### Back up the reader (`reader_backup.py`)
+
+```
+python3 reader_backup.py --out ~/backups/reader_2026-11-11 --power-cycle --id \
+                         --images DIR
+```
+
+Writes `usb/device_descriptor.bin`, `usb/strings.json`,
+`fpga/streamed_segment.bin`, `fpga/live_state.json` (rail echo and chip ID as
+measured), the vendor images under `images/`, a `MANIFEST.md` and a
+`SHA256SUMS` seal over everything. `sha256sum -c SHA256SUMS` is clean, and a
+sealed copy of the images restores the board just like the originals.
+
+The ATtiny13A is **not** in this archive and cannot be: it answers only on the
+SX2's I²C bus, has no write opcode, and addresses only flash 0x02F8..0x03FF.
+Restoring it needs ISP on six soldered wires.
+
+## USB surface
+
+Measured on the live reader.
+
+| Pipe | Result |
+|---|---|
+| Bulk 0x02 out / 0x86 in | the whole working path: config stream, program block, descriptor, DAC word, ID read, rail echo |
+| Bulk 0x04 out | present in the descriptor, but **refuses every bulk write** (timeout) |
+| Bulk 0x88 in | never delivers a byte — idle at cold boot, after a good ID read, after every sweep |
+| Standard control | `GET_STATUS/CONFIG/INTERFACE` answer; `GET_DESCRIPTOR` returns 01/02/03/06/07, and any other type hangs for the full wLength instead of STALLing |
+| Vendor control 0x40/0xC0 | requests 0x00–0x3F: 16/16 timeout. No vendor request handler exists |
+
+**The ATtiny is the reader's identity.** Every descriptor the reader serves is a
+byte-exact copy of its flash:
+
+```
+0x0306  device descriptor      0x0318  device qualifier
+0x0322  config + 4 endpoints   0x0350  strings 1 and 2, langid 1033
+0x0398  0xFF filler            0x03FE  55 AA user signature
+```
+
+So the descriptor page is proven present on the wire but unreachable from the
+host: the SX2 masters that I²C bus in firmware and the stock FPGA design never
+drives those pins. The 184-byte "other speed" descriptor is SX2 ROM, not the
+ATtiny — its header claims 5,816 B and its tail is a rate table that appears
+nowhere in flash. That 5,816 B figure says the SX2 expects a 512 KB config
+device, while the fitted ATtiny13A is 1 KB.
+
+Only EP 0x86 ever carries NAND data because the chip design drives one IN pipe.
+The descriptor is what arms the read: chip design + program block alone stay
+silent, and adding the 32-byte descriptor makes EP 0x86 answer.
+
+**Every descriptor byte matters**, retested through `id_at` on a cold cycle:
+
+| Descriptor change | Reply |
+|---|---|
+| stock | `89 c4 08 32` |
+| byte 10 = 0 | `00 00 00 00` (stable), reply arrives but the read is off |
+| bytes 4, 9, 12 altered | `00 00 00 00` |
+| byte 8, byte 9 = FF, bytes 12–31 all 0 or all FF, bytes 14/15 | **no reply** (timeout) |
+
+Bank select is not a clean 1-of-4. Byte 11 = `0x01`, `0x02`, `0x03`, `0x05`,
+`0x0F` all return `89 c4 08 32`; `0x00`, `0x04`, `0x08`, `0x0C` return
+`00 00 00 00`. The socket presents the die on any selector with bit 0 or bit 1
+set.
+
 ### Compared with NAND_Reader.exe (static only)
 
 Read out of the vendor binary by disassembly; **not** confirmed against a
@@ -329,6 +420,8 @@ whole block), which reproduces the documented sha256 exactly.
 ./nand readp 1000 1010 2040 --out out/   # read single pages (real data)
 ./nand readp 1013 --votes 15 --out out/  # majority-vote a marginal page clean
 ./nand dump --cycle --out out/b1.dump --end 4718592 --unit 18592 --bank 1
+python3 restore_linux.py --images DIR --power-cycle --check   # FPGA back to factory
+python3 reader_backup.py --out DIR --power-cycle --id          # sealed snapshot
 ```
 
 `--cv` is centivolts (330 = 3.30 V). `nand_gui.py` exposes the same operations

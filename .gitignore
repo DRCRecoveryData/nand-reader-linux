@@ -19,3 +19,6 @@ research/k32hook/*.bak*
 research/k32hook/*.out
 research/k32hook/afterboot.log
 research/k32hook/__pycache__/
+
+# vendor-derived FPGA bitstreams: kept locally, not redistributed
+payloads/*.bin

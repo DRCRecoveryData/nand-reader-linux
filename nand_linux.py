@@ -290,8 +290,13 @@ def ensure_awake(attempts=3, settle=0.7):
     raise ReaderError(f"reader did not answer in {attempts} attempts: {last}")
 
 
+CV_MIN, CV_MAX = 90, 330  # outside this the DAC word wraps (90 cV reads 1.94 V)
+
+
 def cv_to_dac(cv):
     # ((cv - 0x50) / 5 | 0x80) ^ 0xFF, 0x80  -> little endian 2 bytes
+    if not CV_MIN <= cv <= CV_MAX:
+        raise ReaderError(f"rail setpoint {cv} cV outside safe {CV_MIN}-{CV_MAX}")
     word = (((cv - 0x50) // 5) | 0x80) ^ 0xFF
     return bytes([word, 0x80])
 
@@ -360,6 +365,7 @@ class Reader:
         self.power_image = None
         self.chip_image = None
         self.program_block = None
+        self.rail_cv = None
 
     def close(self):
         if self.dev is not None:
@@ -382,7 +388,10 @@ class Reader:
         self.dev.write(EP_OUT, buf, WRITE_TIMEOUT_MS)
 
     def _in(self, n):
-        return bytes(self.dev.read(EP_IN, n, IN_TIMEOUT_MS))
+        got = self.dev.read(EP_IN, n, IN_TIMEOUT_MS)
+        if got is None or isinstance(got, int):
+            return b""
+        return bytes(got)
 
     def _chunked(self, buf, chunk=IMAGE_CHUNK):
         """Stream a configuration image in chunks, resending any short write."""
@@ -423,7 +432,7 @@ class Reader:
         return ([(f"0x{EP_IN:02x}", b) for b in got6]
                 + [("0x88", b) for b in got8])
 
-    def load_payloads(self, payload_dir):
+    def load_payloads(self, payload_dir="payloads"):
         self.power_image = load_payload(
             os.path.join(payload_dir, "power_init.bin"), PWR_IMAGE_LEN, POWER_INIT_SHA)
         self.chip_image = load_payload(
@@ -467,12 +476,37 @@ class Reader:
         self._out(b"\xff\xff")
         return self._in(2)
 
-    def id_tail(self, bank=1):
+    def id_tail(self, bank=1, id_size=4):
         desc = bytearray(DESCRIPTOR)
+        desc[8] = id_size
         desc[11] = 1 << (bank - 1)
         return [self.program_block, bytes(desc)]
 
-    def read_id(self, bank=1, payload_dir="payloads", listen_ms=None):
+    def id_at(self, bank=1, cv=330, id_size=4, listen_ms=1500):
+        """READ ID with the rail held at `cv`; returns (id bytes, rail cV).
+
+        Order matters: the power design must take the config slot first so the
+        DAC word lands, then the chip design replaces it and reads. Asking for
+        the rail after the chip design is running does nothing.
+        """
+        self.drain_in()
+        self._chunked(self.power_image)
+        self._out(cv_to_dac(cv))
+        rail = None
+        try:
+            echo = bytes(self.dev.read(EP_IN, 8, IN_TIMEOUT_MS))
+            if len(echo) >= 4:
+                rail = decode_cv(echo)
+        except usb.core.USBError:
+            pass
+        self.drain_in()
+        self._chunked(self.chip_image)
+        self._out(self.program_block)
+        self._out(self.id_tail(bank, id_size)[1])
+        data = bytes(self.dev.read(EP_IN, max(64, id_size), listen_ms))
+        return data[:id_size], rail
+
+    def read_id(self, bank=1, payload_dir="payloads", listen_ms=None, id_size=4):
         """ID leg, as NAND_Reader.exe 0x424f20 orders it: the chip image, then
         the 2,048 B table, then the descriptor, then a read.
 
@@ -488,10 +522,11 @@ class Reader:
         self.drain_in()
         self._chunked(self.chip_image)
         self._out(self.program_block)
-        self._out(self.id_tail(bank)[1])
-        return bytes(self.dev.read(EP_IN, 64,
-                                   listen_ms or int(os.environ.get("NAND_ID_TIMEOUT_MS",
-                                                                   30_000))))
+        self._out(self.id_tail(bank, id_size)[1])
+        data = bytes(self.dev.read(EP_IN, max(64, id_size),
+                                   listen_ms or int(os.environ.get(
+                                       "NAND_ID_TIMEOUT_MS", 30_000))))
+        return data[:id_size]
 
     def boot_rail(self, cv=330):
         """Power design first, on its own configuration slot.
@@ -515,12 +550,17 @@ class Reader:
         A reader that has just been toggled does not always take the next
         design, but it always takes the power image and answers it. Booting
         this design first puts the FPGA in a known state before the leg that
-        actually matters. Returns the echo bytes.
+        actually matters. Returns the echo bytes (empty if none came back).
         """
+        if self.power_image is None:
+            self.load_payloads()
         self.drain_in()
         self._chunked(self.power_image)
         self._out(cv_to_dac(cv))
-        return bytes(self.dev.read(EP_IN, 8, IN_TIMEOUT_MS))
+        got = self.dev.read(EP_IN, 8, IN_TIMEOUT_MS)
+        if got is None or isinstance(got, int):
+            return b""
+        return bytes(got)
 
     def dump_unit(self, page, unit, bank=1, flags=0, re_up=0x22):
         """Configure the chip design and collect exactly one unit for `page`."""
@@ -547,7 +587,25 @@ class Reader:
         read always starts at the page start and the spare area is reached by
         using unit=2176 (2048 data + 128 spare), not by moving the column.
         """
+        return self.page_at(page, unit, bank, column)
+
+    def page_at(self, page, unit=2048, bank=1, column=0, cv=330):
+        """Read one page with the rail held at `cv` (centivolts).
+
+        The DAC setpoint only lands if it trails the power image on the same
+        boot: the chip image takes the single config slot and the power design
+        is never in front of it, so a plain read_page runs at the rail's
+        power-up default regardless of any cv the caller asked for.
+        """
         ctl = _range_ctl(page, page + 1, unit, bank)
+        self.drain_in()
+        self._chunked(self.power_image)
+        self._out(cv_to_dac(cv))
+        try:
+            echo = bytes(self.dev.read(EP_IN, 8, IN_TIMEOUT_MS))
+            self.rail_cv = decode_cv(echo)
+        except (usb.core.USBError, ReaderError):
+            self.rail_cv = None
         self.drain_in()
         self._chunked(self.chip_image)
         self._out(read_page_program(page, column=column))
