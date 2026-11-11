@@ -130,6 +130,31 @@ recognise that ID, so it never issues a dump. The vendor software hits the same
 fixed-pattern wall as the native driver, so the limitation is the FPGA/CPLD
 data path (or an absent NAND), not the host driver.
 
+### Which NAND ops the FPGA forwards (2026-11-11)
+
+The vendor op table lists STATUS `0x05`, ENHANCED STATUS `0x3F`, SET FEATURE
+`0xEF`, READ COLUMN `0x43`, READ CACHE RANDOM `0x46`, CACHE READ `0x31`/`0xE0`.
+Each was emitted in the same proven READ frame, swapping only the command byte
+(read-only: never a PROGRAM/ERASE byte):
+
+| Command | Reply | Meaning |
+|---|---|---|
+| READ ID `0x90` | `89 c4 08 32` | reaches the die |
+| READ `0x30` | 2048 B page | reaches the die |
+| STATUS `0x05` | `05` fill | echo — not forwarded |
+| READ CACHE RANDOM `0x46` | `46` fill | echo — not forwarded |
+| SET FEATURE `0xEF` | 0 B | not forwarded |
+| ENHANCED STATUS `0x3F` | `eb eb 14 14 f4 f4 0b 0b …` | FPGA idle pattern |
+| CACHE READ `0x31` | `eb eb 14 14 f4 f4 0b 0b …` | same idle pattern |
+
+The `0x3F`/`0x31` reply is identical on pages 1026, 900 and 5000, and is
+structured as `[v, v, ~v, ~v]` with `v` cycling `eb f4 fb 00 05 0c` — the FPGA's
+default output register, not a die status. So the FPGA forwards **only READ ID
+and READ**; status/feature/cache commands are not wired through.
+
+Banks 3 and 4 return `30`-fill (one distinct value) at every page tested
+(0, 1026, 2048) via the READ program, confirming the FPGA never selects them.
+
 ### What was ruled out for the dump (2026-11-11)
 
 Each entry is a real measurement on a YKUSH cold cycle, not a guess:
